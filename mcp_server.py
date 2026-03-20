@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
  
 from mcp.server.fastmcp import FastMCP
- 
+from mcp.server.transport_security import TransportSecuritySettings
 # Your existing modules
 from engine import SafetyAuditor
 from clinical_logic import ClinicalLogic
@@ -72,6 +72,9 @@ logger.info(f"MCP endpoint will be at: {RENDER_URL}/mcp")
 # ─────────────────────────────────────────────────────────────────
 mcp = FastMCP(
     name="MedGemma Clinical Safety Auditor",
+     transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    ),
     instructions=(
         "This MCP server provides AI-powered clinical note safety auditing. "
         "It uses a locally-running MedGemma model to detect diagnostic errors, "
