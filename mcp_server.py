@@ -298,10 +298,23 @@ FORMAT:
             from engine import _client
             r = _client.generate(
                 model=os.getenv("MEDGEMMA_MODEL", "MedAIBase/MedGemma1.5:4b"),
-                prompt=prompt, options={"temperature": 0.2, "num_predict": 400}
+                prompt=prompt, options={"temperature": 0.2, "num_predict": 250}
             )
             return r.get("response", "{}")
-        raw = await loop.run_in_executor(None, call_mg)
+        try:
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, call_mg),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            return json.dumps({
+                "status": "timeout",
+                "message": "MedGemma took too long. Try a shorter note.",
+                "fallback_differentials": [
+                    "Acute Coronary Syndrome", "Pulmonary Embolism",
+                    "Aortic Dissection", "Pneumothorax", "Pericarditis"
+                ]
+            })
         match = re.search(r'\{[\s\S]*\}', raw)
         if match:
             try:
@@ -436,8 +449,17 @@ async def second_opinion(clinical_note: str, patient_id: str = "SYNTHETIC-TEST")
     try:
         safe_note = guard.scrub_phi(clinical_note)
         loop = asyncio.get_event_loop()
-        audit1 = await loop.run_in_executor(None, lambda: auditor.audit_note(safe_note, use_cache=True))
-        audit2 = await loop.run_in_executor(None, lambda: auditor.audit_note(safe_note, use_cache=False))
+        try:
+            audit1 = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: auditor.audit_note(safe_note, use_cache=True)),
+                timeout=25.0
+            )
+            audit2 = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: auditor.audit_note(safe_note, use_cache=False)),
+                timeout=25.0
+            )
+        except asyncio.TimeoutError:
+            return json.dumps({"status": "timeout", "message": "Analysis timed out. Try a shorter note."})
         m1 = logic.calculate_safety_metrics(audit1)
         m2 = logic.calculate_safety_metrics(audit2)
         s1, s2 = m1["clinical_gravity_score"], m2["clinical_gravity_score"]
