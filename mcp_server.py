@@ -199,12 +199,23 @@ async def enrich_with_fhir(clinical_note: str, patient_fhir_id: str, patient_id:
     logger.info(f"[Tool 4] enrich_with_fhir | fhir_id={patient_fhir_id}")
     try:
         loop = asyncio.get_event_loop()
-        fhir_summary = await loop.run_in_executor(None, lambda: get_patient_summary(patient_fhir_id))
+        # FHIR fetch with 5 second timeout — skip if server is slow
+        try:
+            fhir_summary = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: get_patient_summary(patient_fhir_id)),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            fhir_summary = f"FHIR history unavailable (timeout) for patient {patient_fhir_id}. Auditing note without history."
         enriched_note = f"{fhir_summary}\n\n=== Current Clinical Note ===\n{clinical_note}"
         result = await _run_audit_pipeline(enriched_note, patient_id)
         result["fhir_patient_id"] = patient_fhir_id
         result["fhir_history_summary"] = fhir_summary
-        result["enrichment_note"] = "Note enriched with FHIR patient history before analysis."
+        result["enrichment_note"] = (
+            "Note enriched with FHIR patient history before analysis."
+            if "unavailable" not in fhir_summary else
+            "FHIR server timeout — note audited without history context."
+        )
         return json.dumps(result, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)})
@@ -418,27 +429,39 @@ async def batch_audit(notes_json: str) -> str:
         notes = json.loads(notes_json)
         if not isinstance(notes, list):
             return json.dumps({"status": "error", "error": "Must be JSON array"})
-        if len(notes) > 10:
-            return json.dumps({"status": "error", "error": "Maximum 10 notes per batch"})
-        results = []
-        for i, item in enumerate(notes):
+        # Cap at 5 notes to prevent timeout
+        if len(notes) > 5:
+            notes = notes[:5]
+            logger.warning("Batch capped at 5 notes to prevent timeout")
+
+        async def audit_one(item, i):
             note = item.get("note", "")
             pid = item.get("patient_id", f"PATIENT-{i+1}")
             if not note.strip():
-                results.append({"patient_id": pid, "status": "skipped"})
-                continue
+                return {"patient_id": pid, "status": "skipped"}
             try:
-                r = await _run_audit_pipeline(note, pid)
-                results.append({
+                safe_note = guard.scrub_phi(note)
+                loop = asyncio.get_event_loop()
+                # Use cached audit for speed
+                audit_result = await loop.run_in_executor(
+                    None, lambda: auditor.audit_note(safe_note, use_cache=True)
+                )
+                metrics = logic.calculate_safety_metrics(audit_result)
+                return {
                     "patient_id": pid,
-                    "clinical_gravity_score": r["clinical_gravity_score"],
-                    "risk_level": r["risk_level"],
-                    "clinical_summary": r["clinical_summary"],
-                    "top_action": r["decision_flow"][0]["action"] if r["decision_flow"] else "No action",
-                    "bias_count": r["bias_analysis"]["count"]
-                })
+                    "clinical_gravity_score": metrics["clinical_gravity_score"],
+                    "risk_level": metrics["risk_level"],
+                    "clinical_summary": metrics["clinical_summary"],
+                    "top_action": metrics["decision_flow"][0]["action"] if metrics["decision_flow"] else "No action",
+                    "bias_count": metrics["bias_analysis"]["count"]
+                }
             except Exception as e:
-                results.append({"patient_id": pid, "status": "error", "error": str(e)})
+                return {"patient_id": pid, "status": "error", "error": str(e)}
+
+        # Run all audits concurrently
+        tasks = [audit_one(item, i) for i, item in enumerate(notes)]
+        results = await asyncio.gather(*tasks)
+        results = list(results)
         results.sort(key=lambda x: x.get("clinical_gravity_score", 0), reverse=True)
         high_risk = [r for r in results if r.get("risk_level") == "HIGH"]
         return json.dumps({
@@ -472,18 +495,16 @@ async def second_opinion(clinical_note: str, patient_id: str = "SYNTHETIC-TEST")
         safe_note = guard.scrub_phi(clinical_note)
         loop = asyncio.get_event_loop()
         try:
-         audit1 = await loop.run_in_executor(
-            None, lambda: auditor.audit_note(safe_note, use_cache=True)
-          )
-         # Second opinion uses same cache — varies by applying different metric weights
-         import copy
-         audit2 = copy.deepcopy(audit1)
-          # Simulate specialist perspective: slightly different confidence
-         if audit2.get("safety_score"):
-            audit2["safety_score"] = min(100, audit2["safety_score"] + 5)
-         audit2["analysis_mode"] = "SPECIALIST_REVIEW"
+            audit1 = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: auditor.audit_note(safe_note, use_cache=True)),
+                timeout=25.0
+            )
+            audit2 = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: auditor.audit_note(safe_note, use_cache=False)),
+                timeout=25.0
+            )
         except asyncio.TimeoutError:
-          return json.dumps({"status": "timeout", "message": "Analysis timed out. Try a shorter note."})
+            return json.dumps({"status": "timeout", "message": "Analysis timed out. Try a shorter note."})
         m1 = logic.calculate_safety_metrics(audit1)
         m2 = logic.calculate_safety_metrics(audit2)
         s1, s2 = m1["clinical_gravity_score"], m2["clinical_gravity_score"]
@@ -528,9 +549,23 @@ async def write_fhir_audit(clinical_note: str, patient_fhir_id: str, patient_id:
     try:
         result = await _run_audit_pipeline(clinical_note, patient_id)
         loop = asyncio.get_event_loop()
-        fhir_result = await loop.run_in_executor(
-            None, lambda: write_audit_to_fhir(patient_fhir_id, result["clinical_summary"], result["clinical_gravity_score"])
-        )
+        # FHIR write with 5 second timeout
+        try:
+            fhir_result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: write_audit_to_fhir(
+                        patient_fhir_id,
+                        result["clinical_summary"],
+                        result["clinical_gravity_score"]
+                    )
+                ),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            fhir_result = {
+                "status": "timeout",
+                "message": "FHIR write timed out — audit completed but not persisted to FHIR"
+            }
         result["fhir_write_back"] = fhir_result
         result["fhir_patient_id"] = patient_fhir_id
         return json.dumps(result, indent=2)
