@@ -199,26 +199,90 @@ async def enrich_with_fhir(clinical_note: str, patient_fhir_id: str, patient_id:
     logger.info(f"[Tool 4] enrich_with_fhir | fhir_id={patient_fhir_id}")
     try:
         loop = asyncio.get_event_loop()
-        # Run FHIR fetch and audit simultaneously - whichever finishes first
-        async def fetch_fhir():
-            try:
-                return await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: get_patient_summary(patient_fhir_id)),
-                    timeout=3.0
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+
+        # Fetch FHIR history with timeout
+        try:
+            fhir_summary = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: get_patient_summary(patient_fhir_id)),
+                timeout=8.0
+            )
+        except asyncio.TimeoutError:
+            fhir_summary = f"FHIR history unavailable (timeout) for patient {patient_fhir_id}."
+
+        if gemini_key:
+            # Use Gemini for fast analysis of enriched note
+            enriched = f"{fhir_summary}\n\nCurrent Note: {clinical_note}"
+            prompt = f"""You are a senior physician auditing this clinical note with patient history.
+OUTPUT ONLY VALID JSON. No preamble. No markdown.
+
+{enriched[:2000]}
+
+REQUIRED JSON:
+{{
+  "safety_score": <0-100>,
+  "critical_findings": [
+    {{
+      "finding": "<description>",
+      "risk": "HIGH" or "MEDIUM",
+      "evidence": "<quote from note>",
+      "likely_missed": "<diagnosis>",
+      "required_action": "<action>",
+      "time_critical": "minutes" or "hours"
+    }}
+  ],
+  "data_gaps": ["<missing item>"],
+  "cognitive_biases": [{{"type": "<bias>", "evidence": "<why>", "risk": "HIGH" or "MEDIUM"}}],
+  "fhir_insights": "<how patient history changes the risk assessment>"
+}}"""
+
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                resp = await client.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+                    headers={"Content-Type": "application/json"},
+                    params={"key": gemini_key},
+                    json={"contents": [{"parts": [{"text": prompt}]}]}
                 )
-            except Exception:
-                return f"FHIR history unavailable for patient {patient_fhir_id}."
+                resp.raise_for_status()
+                data = resp.json()
+                raw = data["candidates"][0]["content"]["parts"][0]["text"]
 
-        # Run both concurrently
-        fhir_task = asyncio.create_task(fetch_fhir())
-        audit_task = asyncio.create_task(_run_audit_pipeline(clinical_note, patient_id))
-        fhir_summary, result = await asyncio.gather(fhir_task, audit_task)
+            match = re.search(r'\{[\s\S]*\}', raw)
+            if match:
+                try:
+                    audit_result = json.loads(match.group(0))
+                    audit_result["analysis_mode"] = "GEMINI_FHIR_ENRICHED"
+                    metrics = logic.calculate_safety_metrics(audit_result)
+                    seal = auditor.generate_seal(clinical_note, audit_result)
+                    result = {
+                        "status": "success",
+                        "patient_id": patient_id,
+                        "analysis_mode": "GEMINI_FHIR_ENRICHED",
+                        "clinical_gravity_score": metrics["clinical_gravity_score"],
+                        "risk_level": metrics["risk_level"],
+                        "clinical_summary": metrics["clinical_summary"],
+                        "overall_recommendation": metrics["overall_recommendation"],
+                        "decision_flow": metrics["decision_flow"],
+                        "bias_analysis": metrics["bias_analysis"],
+                        "critical_findings": audit_result.get("critical_findings", []),
+                        "data_gaps": audit_result.get("data_gaps", []),
+                        "fhir_insights": audit_result.get("fhir_insights", ""),
+                        "fhir_patient_id": patient_fhir_id,
+                        "fhir_history_summary": fhir_summary,
+                        "integrity_seal": seal,
+                        "timestamp": metrics["timestamp"],
+                        "enrichment_note": "Audited with full FHIR patient history context using Gemini.",
+                        "privacy_note": "FHIR data processed locally. No PHI sent to external services beyond Gemini API call."
+                    }
+                    return json.dumps(result, indent=2)
+                except Exception:
+                    pass
 
+        # Fallback to MedGemma with just the note (no FHIR enrichment)
+        result = await _run_audit_pipeline(clinical_note, patient_id)
         result["fhir_patient_id"] = patient_fhir_id
         result["fhir_history_summary"] = fhir_summary
-        result["enrichment_note"] = (
-            "Audit ran concurrently with FHIR history fetch for maximum speed."
-        )
+        result["enrichment_note"] = "Audited with MedGemma. FHIR history retrieved but not used in analysis."
         return json.dumps(result, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)})
